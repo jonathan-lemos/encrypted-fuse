@@ -1,0 +1,206 @@
+use aes_gcm::aead::{Aead, Nonce, OsRng};
+use aes_gcm::aes::cipher::Unsigned;
+use aes_gcm::{AeadCore, Aes256Gcm, KeyInit};
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct UnencryptedData {
+    data: Box<[u8]>,
+}
+
+impl UnencryptedData {
+    pub fn new(data: Box<[u8]>) -> Self {
+        Self { data }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct EncryptedData {
+    data: Box<[u8]>,
+}
+
+impl EncryptedData {
+    pub fn new(data: Box<[u8]>) -> Self {
+        Self { data }
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+pub trait EncryptorDecryptor {
+    fn decrypt(&self, block: &EncryptedData) -> Option<UnencryptedData>;
+    fn encrypt(&self, block: &UnencryptedData) -> Option<EncryptedData>;
+}
+
+pub struct Aes256GcmEncryptorDecryptor {
+    cipher: Aes256Gcm,
+}
+
+impl Aes256GcmEncryptorDecryptor {
+    pub fn new(key: [u8; 32]) -> Self {
+        Self {
+            cipher: Aes256Gcm::new(&key.into()),
+        }
+    }
+}
+
+impl EncryptorDecryptor for Aes256GcmEncryptorDecryptor {
+    fn decrypt(&self, block: &EncryptedData) -> Option<UnencryptedData> {
+        let nonce_len = <Aes256Gcm as AeadCore>::NonceSize::to_usize();
+
+        if block.data().len() < nonce_len {
+            return None;
+        }
+
+        let nonce_bytes = &block.data()[..nonce_len];
+        let encrypted_data = &block.data()[nonce_len..];
+
+        let nonce = Nonce::<Aes256Gcm>::from_slice(nonce_bytes);
+        match self.cipher.decrypt(nonce, encrypted_data) {
+            Ok(bytes) => Some(UnencryptedData::new(bytes.into_boxed_slice())),
+            Err(_) => None,
+        }
+    }
+
+    fn encrypt(&self, block: &UnencryptedData) -> Option<EncryptedData> {
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+
+        let nonce_length = <Aes256Gcm as AeadCore>::NonceSize::to_usize();
+        let nonce_bytes = nonce.as_slice();
+        assert_eq!(nonce_length, nonce_bytes.len());
+
+        let encrypted_data = match self.cipher.encrypt(&nonce, block.data()) {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+
+        let total_bytes = [nonce_bytes, &encrypted_data].concat();
+
+        Some(EncryptedData::new(total_bytes.into_boxed_slice()))
+    }
+}
+
+#[cfg(test)]
+pub mod testing {
+    use super::*;
+    use std::collections::HashMap;
+
+    pub struct FakeDataEncryptorDecryptor {
+        encrypt_pairs: HashMap<UnencryptedData, EncryptedData>,
+        decrypt_pairs: HashMap<EncryptedData, UnencryptedData>,
+    }
+
+    impl FakeDataEncryptorDecryptor {
+        pub fn new() -> Self {
+            Self {
+                encrypt_pairs: HashMap::new(),
+                decrypt_pairs: HashMap::new(),
+            }
+        }
+
+        pub fn expect_encryption(
+            &mut self,
+            unencrypted_block: &UnencryptedData,
+            encrypted_block: &EncryptedData,
+        ) {
+            self.encrypt_pairs
+                .insert(unencrypted_block.clone(), encrypted_block.clone());
+        }
+
+        pub fn expect_decryption(
+            &mut self,
+            encrypted_block: &EncryptedData,
+            unencrypted_block: &UnencryptedData,
+        ) {
+            self.decrypt_pairs
+                .insert(encrypted_block.clone(), unencrypted_block.clone());
+        }
+    }
+
+    impl EncryptorDecryptor for FakeDataEncryptorDecryptor {
+        fn decrypt(&self, block: &EncryptedData) -> Option<UnencryptedData> {
+            self.decrypt_pairs.get(&block).cloned()
+        }
+
+        fn encrypt(&self, block: &UnencryptedData) -> Option<EncryptedData> {
+            self.encrypt_pairs.get(&block).cloned()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encryption::testing::FakeDataEncryptorDecryptor;
+
+    #[test]
+    fn test_fake_encryptor() {
+        let mut encryptor = FakeDataEncryptorDecryptor::new();
+
+        let unencrypted1 = UnencryptedData::new(Box::new([1, 2, 3, 4, 5]));
+        let unencrypted2 = UnencryptedData::new(Box::new([69, 4, 20]));
+        let unencrypted3 = UnencryptedData::new(Box::new([6, 9, 4, 2, 0]));
+
+        let encrypted1 = EncryptedData::new(Box::new([5, 4, 3, 2, 1]));
+        let encrypted2 = EncryptedData::new(Box::new([42, 69]));
+        let encrypted3 = EncryptedData::new(Box::new([4, 2, 0, 6, 9]));
+
+        encryptor.expect_encryption(&unencrypted1, &encrypted1);
+        encryptor.expect_encryption(&unencrypted2, &encrypted2);
+        encryptor.expect_decryption(&encrypted1, &unencrypted1);
+        encryptor.expect_decryption(&encrypted2, &unencrypted3);
+
+        assert_eq!(encryptor.encrypt(&unencrypted1), Some(encrypted1.clone()));
+        assert_eq!(encryptor.encrypt(&unencrypted2), Some(encrypted2.clone()));
+        assert_eq!(encryptor.encrypt(&unencrypted3), None);
+
+        assert_eq!(encryptor.decrypt(&encrypted1), Some(unencrypted1.clone()));
+        assert_eq!(encryptor.decrypt(&encrypted2), Some(unencrypted3.clone()));
+        assert_eq!(encryptor.decrypt(&encrypted3), None);
+    }
+
+    #[test]
+    fn test_aes256_round_trip() {
+        let encryptor = Aes256GcmEncryptorDecryptor::new([69; 32]);
+        let data = UnencryptedData::new(Box::new([1, 2, 3, 4, 5]));
+
+        let encrypted = encryptor.encrypt(&data).unwrap();
+        let decrypted = encryptor.decrypt(&encrypted).unwrap();
+
+        assert_eq!(data, decrypted);
+        assert_ne!(encrypted.data(), decrypted.data());
+    }
+
+    #[test]
+    fn test_aes256_round_trip_large_data() {
+        let encryptor = Aes256GcmEncryptorDecryptor::new([69; 32]);
+        let mut bytes = Vec::with_capacity(1_000_000);
+        for i in 0..1_000_000usize {
+            bytes.push(i as u8);
+        }
+        let data = UnencryptedData::new(bytes.into_boxed_slice());
+
+        let encrypted = encryptor.encrypt(&data).unwrap();
+        let decrypted = encryptor.decrypt(&encrypted).unwrap();
+
+        assert_eq!(data, decrypted);
+        assert_ne!(encrypted.data(), decrypted.data());
+    }
+
+    #[test]
+    fn test_aes256_round_trip_no_data() {
+        let encryptor = Aes256GcmEncryptorDecryptor::new([69; 32]);
+        let data = UnencryptedData::new(Box::new([]));
+
+        let encrypted = encryptor.encrypt(&data).unwrap();
+        let decrypted = encryptor.decrypt(&encrypted).unwrap();
+
+        assert_eq!(data, decrypted);
+        assert_ne!(encrypted.data(), decrypted.data());
+    }
+}
