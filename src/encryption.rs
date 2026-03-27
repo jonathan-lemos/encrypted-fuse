@@ -8,8 +8,8 @@ pub struct UnencryptedData {
 }
 
 impl UnencryptedData {
-    pub fn new(data: Box<[u8]>) -> Self {
-        Self { data }
+    pub fn literal(data: &[u8]) -> Self {
+        Self { data: data.into() }
     }
 
     pub fn data(&self) -> &[u8] {
@@ -23,8 +23,8 @@ pub struct EncryptedData {
 }
 
 impl EncryptedData {
-    pub fn new(data: Box<[u8]>) -> Self {
-        Self { data }
+    pub fn literal(data: &[u8]) -> Self {
+        Self { data: data.into() }
     }
 
     pub fn data(&self) -> &[u8] {
@@ -62,7 +62,7 @@ impl EncryptorDecryptor for Aes256GcmEncryptorDecryptor {
 
         let nonce = Nonce::<Aes256Gcm>::from_slice(nonce_bytes);
         match self.cipher.decrypt(nonce, encrypted_data) {
-            Ok(bytes) => Some(UnencryptedData::new(bytes.into_boxed_slice())),
+            Ok(bytes) => Some(UnencryptedData::literal(&bytes)),
             Err(_) => None,
         }
     }
@@ -81,7 +81,7 @@ impl EncryptorDecryptor for Aes256GcmEncryptorDecryptor {
 
         let total_bytes = [nonce_bytes, &encrypted_data].concat();
 
-        Some(EncryptedData::new(total_bytes.into_boxed_slice()))
+        Some(EncryptedData::literal(&total_bytes))
     }
 }
 
@@ -142,13 +142,13 @@ mod tests {
     fn test_fake_encryptor() {
         let mut encryptor = FakeDataEncryptorDecryptor::new();
 
-        let unencrypted1 = UnencryptedData::new(Box::new([1, 2, 3, 4, 5]));
-        let unencrypted2 = UnencryptedData::new(Box::new([69, 4, 20]));
-        let unencrypted3 = UnencryptedData::new(Box::new([6, 9, 4, 2, 0]));
+    let unencrypted1 = UnencryptedData::literal(&[1, 2, 3, 4, 5]);
+    let unencrypted2 = UnencryptedData::literal(&[69, 4, 20]);
+        let unencrypted3 = UnencryptedData::literal(&[6, 9, 4, 2, 0]);
 
-        let encrypted1 = EncryptedData::new(Box::new([5, 4, 3, 2, 1]));
-        let encrypted2 = EncryptedData::new(Box::new([42, 69]));
-        let encrypted3 = EncryptedData::new(Box::new([4, 2, 0, 6, 9]));
+        let encrypted1 = EncryptedData::literal(&[5, 4, 3, 2, 1]);
+        let encrypted2 = EncryptedData::literal(&[42, 69]);
+        let encrypted3 = EncryptedData::literal(&[4, 2, 0, 6, 9]);
 
         encryptor.expect_encryption(&unencrypted1, &encrypted1);
         encryptor.expect_encryption(&unencrypted2, &encrypted2);
@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn test_aes256_round_trip() {
         let encryptor = Aes256GcmEncryptorDecryptor::new([69; 32]);
-        let data = UnencryptedData::new(Box::new([1, 2, 3, 4, 5]));
+        let data = UnencryptedData::literal(&[1, 2, 3, 4, 5]);
 
         let encrypted = encryptor.encrypt(&data).unwrap();
         let decrypted = encryptor.decrypt(&encrypted).unwrap();
@@ -183,7 +183,7 @@ mod tests {
         for i in 0..1_000_000usize {
             bytes.push(i as u8);
         }
-        let data = UnencryptedData::new(bytes.into_boxed_slice());
+        let data = UnencryptedData::literal(&bytes);
 
         let encrypted = encryptor.encrypt(&data).unwrap();
         let decrypted = encryptor.decrypt(&encrypted).unwrap();
@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn test_aes256_round_trip_no_data() {
         let encryptor = Aes256GcmEncryptorDecryptor::new([69; 32]);
-        let data = UnencryptedData::new(Box::new([]));
+        let data = UnencryptedData::literal(&[]);
 
         let encrypted = encryptor.encrypt(&data).unwrap();
         let decrypted = encryptor.decrypt(&encrypted).unwrap();

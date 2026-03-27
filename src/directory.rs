@@ -31,8 +31,7 @@ impl Directory for FilesystemDirectory {
     }
 
     fn read_file(&self, path: &Path) -> Result<EncryptedData> {
-        std::fs::read(self.base_dir.join(path))
-            .map(|bytes| EncryptedData::new(bytes.into_boxed_slice()))
+        std::fs::read(self.base_dir.join(path)).map(|bytes| EncryptedData::literal(&bytes))
     }
 
     fn write_file(&self, path: &Path, data: &EncryptedData) -> Result<()> {
@@ -53,6 +52,34 @@ pub mod testing {
         files: HashMap<PathBuf, EncryptedData>,
     }
 
+    impl FakeDirectoryState {
+        fn empty_directory() -> &'static Path {
+            Path::new("")
+        }
+
+        fn parent_exists(&self, path: &Path) -> bool {
+            match path.parent() {
+                Some(parent) => self.subdirs.contains(parent) || parent == Self::empty_directory(),
+                None => false,
+            }
+        }
+
+        fn exists(&self, path: &Path) -> bool {
+            self.is_directory(path) || self.is_file(path)
+        }
+
+        fn is_directory(&self, path: &Path) -> bool {
+            if path == Self::empty_directory() {
+                return true;
+            }
+            self.subdirs.contains(path)
+        }
+
+        fn is_file(&self, path: &Path) -> bool {
+            self.files.contains_key(path)
+        }
+    }
+
     pub struct FakeDirectory {
         state: Mutex<FakeDirectoryState>,
     }
@@ -61,10 +88,45 @@ pub mod testing {
         pub fn new() -> Self {
             Self {
                 state: Mutex::new(FakeDirectoryState {
-                    subdirs: HashSet::from([PathBuf::new()]),
+                    subdirs: HashSet::new(),
                     files: HashMap::new(),
                 }),
             }
+        }
+
+        pub fn exists(&self, path: &Path) -> bool {
+            let state = self.state.lock().unwrap();
+            state.exists(path)
+        }
+
+        pub fn is_directory(&self, path: &Path) -> bool {
+            let state = self.state.lock().unwrap();
+            state.is_directory(path)
+        }
+
+        pub fn is_file(&self, path: &Path) -> bool {
+            let state = self.state.lock().unwrap();
+            state.is_file(path)
+        }
+
+        pub fn list_subdir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+            let state = self.state.lock().unwrap();
+
+            if state.is_file(path) {
+                return Err(ErrorKind::NotADirectory.into());
+            }
+
+            if !state.is_directory(path) {
+                return Err(ErrorKind::NotFound.into());
+            }
+
+            let mut results = Vec::new();
+            for (p, _) in state.files.iter() {
+                if p.parent() == Some(path) {
+                    results.push(p.clone())
+                }
+            }
+            Ok(results)
         }
     }
 
@@ -72,22 +134,27 @@ pub mod testing {
         fn create_subdir(&self, path: &Path) -> Result<()> {
             let mut state = self.state.lock().unwrap();
 
-            if let Some(parent) = path.parent()
-                && !state.subdirs.contains(parent)
-            {
+            if state.exists(path) {
+                return Err(ErrorKind::AlreadyExists.into());
+            }
+            if !state.parent_exists(path) {
                 return Err(ErrorKind::NotFound.into());
             }
 
-            if state.subdirs.contains(path) || state.files.contains_key(path) {
-                Err(ErrorKind::AlreadyExists.into())
-            } else {
-                state.subdirs.insert(path.to_owned());
-                Ok(())
-            }
+            state.subdirs.insert(path.to_owned());
+            Ok(())
         }
 
         fn delete_file(&self, path: &Path) -> Result<()> {
             let mut state = self.state.lock().unwrap();
+
+            if !state.exists(path) {
+                return Err(ErrorKind::NotFound.into());
+            }
+
+            if state.is_directory(path) {
+                return Err(ErrorKind::IsADirectory.into());
+            }
 
             match state.files.remove(path) {
                 Some(_) => Ok(()),
@@ -98,6 +165,10 @@ pub mod testing {
         fn read_file(&self, path: &Path) -> Result<EncryptedData> {
             let state = self.state.lock().unwrap();
 
+            if state.is_directory(path) {
+                return Err(ErrorKind::IsADirectory.into());
+            }
+
             match state.files.get(path) {
                 Some(data) => Ok(data.clone()),
                 None => Err(ErrorKind::NotFound.into()),
@@ -107,106 +178,30 @@ pub mod testing {
         fn write_file(&self, path: &Path, data: &EncryptedData) -> Result<()> {
             let mut state = self.state.lock().unwrap();
 
-            if let Some(parent) = path.parent()
-            {
-                if !state.subdirs.contains(parent) {
-                    return Err(ErrorKind::NotFound.into())
-                }
-            } else {
-                return Err(ErrorKind::InvalidFilename.into());
+            if state.is_directory(path) {
+                return Err(ErrorKind::IsADirectory.into());
+            }
+
+            if !state.parent_exists(path) {
+                return Err(ErrorKind::NotFound.into());
             }
 
             state.files.insert(path.to_owned(), data.clone());
-                Ok(())
+            Ok(())
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::testing::*;
     use super::*;
-    use crate::directory::testing::FakeDirectory;
+    use assertables::{assert_err, assert_ok, assert_ok_eq_x};
+    use rstest::rstest;
+    use std::fmt::Debug;
+    use std::io::ErrorKind;
+    use std::io::Result;
     use tempdir::TempDir;
-
-    #[test]
-    fn test_fake_directory() {
-        let dir = FakeDirectory::new();
-
-        assert!(dir.create_subdir(Path::new("foo")).is_ok());
-        assert!(dir.create_subdir(Path::new("foo/bar")).is_ok());
-        assert!(dir.create_subdir(Path::new("no/exist")).is_err());
-        assert!(dir.create_subdir(Path::new("")).is_err());
-
-        assert!(
-            dir.write_file(
-                Path::new("foo/thing.txt"),
-                &EncryptedData::new([1, 2, 3].into())
-            )
-            .is_ok()
-        );
-        assert!(
-            dir.write_file(
-                Path::new("foo/bar/thing2.txt"),
-                &EncryptedData::new([4, 5, 6].into())
-            )
-            .is_ok()
-        );
-        assert!(
-            dir.write_file(
-                Path::new("thing3.txt"),
-                &EncryptedData::new([7, 8, 9].into())
-            )
-            .is_ok()
-        );
-        assert!(
-            dir.write_file(
-                Path::new("thing3.txt"),
-                &EncryptedData::new([10, 11, 12].into())
-            )
-            .is_ok()
-        );
-        assert!(
-            dir.write_file(
-                Path::new("no/exist.txt"),
-                &EncryptedData::new([13, 14, 15].into())
-            )
-            .is_err()
-        );
-        assert!(
-            dir.write_file(Path::new(""), &EncryptedData::new([16, 17, 18].into()))
-                .is_err()
-        );
-
-        assert_eq!(
-            dir.read_file(Path::new("foo/thing.txt")).unwrap(),
-            EncryptedData::new([1, 2, 3].into())
-        );
-        assert_eq!(
-            dir.read_file(Path::new("foo/bar/thing2.txt")).unwrap(),
-            EncryptedData::new([4, 5, 6].into())
-        );
-        assert_eq!(
-            dir.read_file(Path::new("thing3.txt")).unwrap(),
-            EncryptedData::new([10, 11, 12].into())
-        );
-        assert!(dir.read_file(Path::new("no/exist.txt")).is_err());
-        assert!(dir.read_file(Path::new("foo")).is_err());
-        assert!(dir.read_file(Path::new("")).is_err());
-
-        assert!(dir.delete_file(Path::new("foo/thing.txt")).is_ok());
-        assert!(dir.read_file(Path::new("foo/thing.txt")).is_err());
-
-        assert!(dir.delete_file(Path::new("foo/bar/thing2.txt")).is_ok());
-        assert!(dir.read_file(Path::new("foo/bar/thing2.txt")).is_err());
-
-        assert!(dir.delete_file(Path::new("thing3.txt")).is_ok());
-        assert!(dir.read_file(Path::new("thing3.txt")).is_err());
-
-        assert!(dir.read_file(Path::new("thing3.txt")).is_err());
-        assert!(dir.delete_file(Path::new("no/exist.txt")).is_err());
-        assert!(dir.delete_file(Path::new("foo")).is_err());
-        assert!(dir.delete_file(Path::new("")).is_err());
-    }
 
     fn temp_fs_dir() -> (TempDir, FilesystemDirectory) {
         let temp_dir = TempDir::new("filesystem_directory_test").unwrap();
@@ -214,123 +209,374 @@ mod tests {
 
         (temp_dir, filesystem_directory)
     }
-    #[test]
-    fn test_filesystem_create_directory() {
-        let (temp_dir, fs_dir) = temp_fs_dir();
 
-        assert!(fs_dir.create_subdir(Path::new("foo")).is_ok());
-        assert!(fs_dir.create_subdir(Path::new("foo/bar")).is_ok());
-        assert!(fs_dir.create_subdir(Path::new("does/not/exist")).is_err());
+    // Implement Directory for the pair above so the TempDir remains in scope while
+    // the test is ongoing and deletes the TempDir when the test is done.
+    impl Directory for (TempDir, FilesystemDirectory) {
+        fn create_subdir(&self, path: &Path) -> Result<()> {
+            self.1.create_subdir(path)
+        }
 
-        assert!(temp_dir.path().join("foo").is_dir());
-        assert!(temp_dir.path().join("foo").join("bar").is_dir());
+        fn delete_file(&self, path: &Path) -> Result<()> {
+            self.1.delete_file(path)
+        }
+
+        fn read_file(&self, path: &Path) -> Result<EncryptedData> {
+            self.1.read_file(path)
+        }
+
+        fn write_file(&self, path: &Path, data: &EncryptedData) -> Result<()> {
+            self.1.write_file(path, data)
+        }
     }
 
-    #[test]
-    fn test_filesystem_delete_file() {
-        let (temp_dir, fs_dir) = temp_fs_dir();
-
-        std::fs::create_dir(temp_dir.path().join("foo")).unwrap();
-        std::fs::create_dir(temp_dir.path().join("foo/bar")).unwrap();
-        std::fs::write(temp_dir.path().join("foo/thing.txt"), [1, 2, 3]).unwrap();
-        std::fs::write(temp_dir.path().join("foo/bar/thing2.txt"), [4, 5, 6]).unwrap();
-        std::fs::write(temp_dir.path().join("thing3.txt"), [7, 8, 9]).unwrap();
-
-        assert!(fs_dir.delete_file(Path::new("foo/thing.txt")).is_ok());
-        assert!(!std::fs::exists(Path::new("foo/thing.txt")).unwrap());
-        assert!(fs_dir.delete_file(Path::new("foo/bar/thing2.txt")).is_ok());
-        assert!(!std::fs::exists(Path::new("foo/bar/thing2.txt")).unwrap());
-        assert!(fs_dir.delete_file(Path::new("thing3.txt")).is_ok());
-        assert!(!std::fs::exists(Path::new("thing3.txt")).unwrap());
-        assert!(fs_dir.delete_file(Path::new("thing3.txt")).is_err());
-        assert!(fs_dir.delete_file(Path::new("no/exist.txt")).is_err());
+    fn assert_error_kind<T: Debug>(result: Result<T>, kind: ErrorKind) {
+        let err = assert_err!(&result);
+        assert_eq!(err.kind(), kind);
     }
 
-    #[test]
-    fn test_filesystem_write_file() {
-        let (temp_dir, fs_dir) = temp_fs_dir();
-
-        std::fs::create_dir(temp_dir.path().join("foo")).unwrap();
-        std::fs::create_dir(temp_dir.path().join("foo/bar")).unwrap();
-
-        assert!(
-            fs_dir
-                .write_file(
-                    Path::new("foo/thing.txt"),
-                    &EncryptedData::new([1, 2, 3].into())
-                )
-                .is_ok()
-        );
-        assert!(
-            fs_dir
-                .write_file(
-                    Path::new("foo/bar/thing2.txt"),
-                    &EncryptedData::new([4, 5, 6].into())
-                )
-                .is_ok()
-        );
-        assert!(
-            fs_dir
-                .write_file(
-                    Path::new("thing3.txt"),
-                    &EncryptedData::new([7, 8, 9].into())
-                )
-                .is_ok()
-        );
-        assert!(
-            fs_dir
-                .write_file(
-                    Path::new("thing3.txt"),
-                    &EncryptedData::new([10, 11, 12].into())
-                )
-                .is_ok()
-        );
-        assert!(
-            fs_dir
-                .write_file(
-                    Path::new("does/not/exist.txt"),
-                    &EncryptedData::new([12, 13, 14].into())
-                )
-                .is_err()
-        );
-
-        assert_eq!(
-            std::fs::read(temp_dir.path().join("foo/thing.txt")).unwrap(),
-            [1, 2, 3]
-        );
-        assert_eq!(
-            std::fs::read(temp_dir.path().join("foo/bar/thing2.txt")).unwrap(),
-            [4, 5, 6]
-        );
-        assert_eq!(
-            std::fs::read(temp_dir.path().join("thing3.txt")).unwrap(),
-            [10, 11, 12]
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_create_duplicate_dir_fails(#[case] dir: impl Directory) {
+        assert_ok!(dir.create_subdir(Path::new("foo")));
+        assert_error_kind(
+            dir.create_subdir(Path::new("foo")),
+            ErrorKind::AlreadyExists,
         );
     }
 
-    #[test]
-    fn test_filesystem_read_file() {
-        let (temp_dir, fs_dir) = temp_fs_dir();
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_create_subdir_without_parent_fails(#[case] dir: impl Directory) {
+        assert_error_kind(dir.create_subdir(Path::new("foo/bar")), ErrorKind::NotFound);
+    }
 
-        std::fs::create_dir(temp_dir.path().join("foo")).unwrap();
-        std::fs::create_dir(temp_dir.path().join("foo/bar")).unwrap();
-        std::fs::write(temp_dir.path().join("foo/thing.txt"), [1, 2, 3]).unwrap();
-        std::fs::write(temp_dir.path().join("foo/bar/thing2.txt"), [4, 5, 6]).unwrap();
-        std::fs::write(temp_dir.path().join("thing3.txt"), [7, 8, 9]).unwrap();
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_create_root_dir_fails(#[case] dir: impl Directory) {
+        assert_error_kind(dir.create_subdir(Path::new("")), ErrorKind::AlreadyExists);
+    }
 
-        assert_eq!(
-            fs_dir.read_file(Path::new("foo/thing.txt")).unwrap(),
-            EncryptedData::new([1, 2, 3].into())
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_delete_file_fails_for_nonexistent_file(#[case] dir: impl Directory) {
+        assert_error_kind(dir.delete_file(Path::new("foo")), ErrorKind::NotFound);
+        assert_error_kind(dir.delete_file(Path::new("foo/bar")), ErrorKind::NotFound);
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_delete_file_fails_for_directory(#[case] dir: impl Directory) {
+        assert_error_kind(dir.delete_file(Path::new("")), ErrorKind::IsADirectory);
+        assert_ok!(dir.create_subdir(Path::new("foo")));
+        assert_error_kind(dir.delete_file(Path::new("foo")), ErrorKind::IsADirectory);
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_delete_file_no_longer_exists(#[case] dir: impl Directory) {
+        assert_ok!(dir.write_file(Path::new("foo"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok!(dir.delete_file(Path::new("foo")));
+        assert_error_kind(dir.read_file(Path::new("foo")), ErrorKind::NotFound);
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_delete_file_in_subdir(#[case] dir: impl Directory) {
+        assert_ok!(dir.create_subdir(Path::new("foo")));
+        assert_ok!(dir.write_file(Path::new("foo/bar"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok!(dir.delete_file(Path::new("foo/bar")));
+        assert_error_kind(dir.read_file(Path::new("foo/bar")), ErrorKind::NotFound);
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_delete_file_in_sub_subdir(#[case] dir: impl Directory) {
+        assert_ok!(dir.create_subdir(Path::new("foo")));
+        assert_ok!(dir.create_subdir(Path::new("foo/bar")));
+        assert_ok!(dir.write_file(
+            Path::new("foo/bar/baz"),
+            &EncryptedData::literal(&[1, 2, 3])
+        ));
+        assert_ok!(dir.delete_file(Path::new("foo/bar/baz")));
+        assert_error_kind(dir.read_file(Path::new("foo/bar/baz")), ErrorKind::NotFound);
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_read_file_fails_for_nonexistent_file(#[case] dir: impl Directory) {
+        assert_error_kind(dir.read_file(Path::new("foo")), ErrorKind::NotFound);
+        assert_error_kind(dir.read_file(Path::new("foo/bar")), ErrorKind::NotFound);
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_read_file_fails_for_directory(#[case] dir: impl Directory) {
+        assert_error_kind(dir.read_file(Path::new("")), ErrorKind::IsADirectory);
+        assert_ok!(dir.create_subdir(Path::new("foo")));
+        assert_error_kind(dir.read_file(Path::new("foo")), ErrorKind::IsADirectory);
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_write_file_fails_for_directory(#[case] dir: impl Directory) {
+        assert_error_kind(
+            dir.write_file(Path::new(""), &EncryptedData::literal(&[1, 2, 3])),
+            ErrorKind::IsADirectory,
         );
-        assert_eq!(
-            fs_dir.read_file(Path::new("foo/bar/thing2.txt")).unwrap(),
-            EncryptedData::new([4, 5, 6].into())
+        assert_ok!(dir.create_subdir(Path::new("foo")));
+        assert_error_kind(
+            dir.write_file(Path::new("foo"), &EncryptedData::literal(&[1, 2, 3])),
+            ErrorKind::IsADirectory,
         );
-        assert_eq!(
-            fs_dir.read_file(Path::new("thing3.txt")).unwrap(),
-            EncryptedData::new([7, 8, 9].into())
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_write_file_multiple_files(#[case] dir: impl Directory) {
+        assert_ok!(dir.create_subdir(Path::new("dir1")));
+        assert_ok!(dir.create_subdir(Path::new("dir1/dir2")));
+        assert_ok!(dir.create_subdir(Path::new("dir2")));
+
+        assert_ok!(dir.write_file(Path::new("file1"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok!(dir.write_file(Path::new("file2"), &EncryptedData::literal(&[4, 5, 6])));
+        assert_ok!(dir.write_file(Path::new("dir1/file1"), &EncryptedData::literal(&[7, 8, 9])));
+        assert_ok!(dir.write_file(
+            Path::new("dir1/dir2/file3"),
+            &EncryptedData::literal(&[10, 11, 12])
+        ));
+
+        assert_ok_eq_x!(
+            &dir.read_file(Path::new("file1")),
+            &EncryptedData::literal(&[1, 2, 3])
         );
-        assert!(fs_dir.read_file(Path::new("no/exist.txt")).is_err());
-        assert!(fs_dir.read_file(Path::new("foo")).is_err());
+        assert_ok_eq_x!(
+            &dir.read_file(Path::new("file2")),
+            &EncryptedData::literal(&[4, 5, 6])
+        );
+        assert_ok_eq_x!(
+            &dir.read_file(Path::new("dir1/file1")),
+            &EncryptedData::literal(&[7, 8, 9])
+        );
+        assert_ok_eq_x!(
+            &dir.read_file(Path::new("dir1/dir2/file3")),
+            &EncryptedData::literal(&[10, 11, 12])
+        );
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_write_file_overwrites(#[case] dir: impl Directory) {
+        assert_ok!(dir.write_file(Path::new("foo"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok!(dir.write_file(Path::new("foo"), &EncryptedData::literal(&[4, 5, 6])));
+        assert_ok_eq_x!(
+            &dir.read_file(Path::new("foo")),
+            &EncryptedData::literal(&[4, 5, 6])
+        );
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_write_file_round_trip(#[case] dir: impl Directory) {
+        assert_ok!(dir.write_file(Path::new("foo"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok_eq_x!(
+            &dir.read_file(Path::new("foo")),
+            &EncryptedData::literal(&[1, 2, 3])
+        );
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_write_file_in_subdir(#[case] dir: impl Directory) {
+        assert_ok!(dir.create_subdir(Path::new("foo")));
+        assert_ok!(dir.write_file(Path::new("foo/bar"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok_eq_x!(
+            &dir.read_file(Path::new("foo/bar")),
+            &EncryptedData::literal(&[1, 2, 3])
+        );
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_write_file_in_sub_subdir(#[case] dir: impl Directory) {
+        assert_ok!(dir.create_subdir(Path::new("foo")));
+        assert_ok!(dir.create_subdir(Path::new("foo/bar")));
+        assert_ok!(dir.write_file(
+            Path::new("foo/bar/baz"),
+            &EncryptedData::literal(&[1, 2, 3])
+        ));
+        assert_ok_eq_x!(
+            &dir.read_file(Path::new("foo/bar/baz")),
+            &EncryptedData::literal(&[1, 2, 3])
+        );
+    }
+
+    mod fake_directory_tests {
+        use super::super::testing::*;
+        use super::super::*;
+        use super::*;
+
+        #[test]
+        fn test_exists() {
+            let dir = FakeDirectory::new();
+
+            assert_ok!(dir.create_subdir(Path::new("foo")));
+            assert_ok!(dir.create_subdir(Path::new("foo/bar")));
+            assert_ok!(dir.create_subdir(Path::new("baz")));
+
+            assert_ok!(dir.write_file(
+                Path::new("foo/file1"),
+                &EncryptedData::literal(&[1, 2, 3])
+            ));
+            assert_ok!(dir.write_file(
+                Path::new("file2"),
+                &EncryptedData::literal(&[1, 2, 3])
+            ));
+            assert_ok!(dir.write_file(
+                Path::new("foo/bar/file3"),
+                &EncryptedData::literal(&[1, 2, 3])
+            ));
+
+            assert!(dir.exists(Path::new("")));
+            assert!(dir.exists(Path::new("foo")));
+            assert!(dir.exists(Path::new("foo/file1")));
+            assert!(dir.exists(Path::new("foo/bar")));
+            assert!(dir.exists(Path::new("foo/bar/file3")));
+            assert!(dir.exists(Path::new("file2")));
+            assert!(dir.exists(Path::new("baz")));
+
+            assert!(!dir.exists(Path::new("blah")));
+            assert!(!dir.exists(Path::new("foo/blah")));
+            assert!(!dir.exists(Path::new("foo/bar/blah")));
+        }
+
+        #[test]
+        fn test_is_directory() {
+            let dir = FakeDirectory::new();
+
+            assert_ok!(dir.create_subdir(Path::new("foo")));
+            assert_ok!(dir.create_subdir(Path::new("foo/bar")));
+            assert_ok!(dir.create_subdir(Path::new("baz")));
+
+            assert_ok!(dir.write_file(
+                Path::new("foo/file1"),
+                &EncryptedData::literal(&[1, 2, 3])
+            ));
+            assert_ok!(dir.write_file(
+                Path::new("file2"),
+                &EncryptedData::literal(&[1, 2, 3])
+            ));
+            assert_ok!(dir.write_file(
+                Path::new("foo/bar/file3"),
+                &EncryptedData::literal(&[1, 2, 3])
+            ));
+
+            assert!(dir.is_directory(Path::new("")));
+            assert!(dir.is_directory(Path::new("foo")));
+            assert!(dir.is_directory(Path::new("foo/bar")));
+            assert!(dir.is_directory(Path::new("baz")));
+
+            assert!(!dir.is_directory(Path::new("foo/file1")));
+            assert!(!dir.is_directory(Path::new("foo/bar/file3")));
+            assert!(!dir.is_directory(Path::new("file2")));
+            assert!(!dir.is_directory(Path::new("blah")));
+            assert!(!dir.is_directory(Path::new("foo/blah")));
+            assert!(!dir.is_directory(Path::new("foo/bar/blah")));
+        }
+
+        #[test]
+        fn test_is_file() {
+            let dir = FakeDirectory::new();
+
+            assert_ok!(dir.create_subdir(Path::new("foo")));
+            assert_ok!(dir.create_subdir(Path::new("foo/bar")));
+            assert_ok!(dir.create_subdir(Path::new("baz")));
+
+            assert_ok!(dir.write_file(
+                Path::new("foo/file1"),
+                &EncryptedData::literal(&[1, 2, 3])
+            ));
+            assert_ok!(dir.write_file(
+                Path::new("file2"),
+                &EncryptedData::literal(&[1, 2, 3])
+            ));
+            assert_ok!(dir.write_file(
+                Path::new("foo/bar/file3"),
+                &EncryptedData::literal(&[1, 2, 3])
+            ));
+
+            assert!(dir.is_file(Path::new("foo/file1")));
+            assert!(dir.is_file(Path::new("foo/bar/file3")));
+            assert!(dir.is_file(Path::new("file2")));
+
+            assert!(!dir.is_file(Path::new("")));
+            assert!(!dir.is_file(Path::new("foo")));
+            assert!(!dir.is_file(Path::new("foo/bar")));
+            assert!(!dir.is_file(Path::new("baz")));
+            assert!(!dir.is_file(Path::new("blah")));
+            assert!(!dir.is_file(Path::new("foo/blah")));
+            assert!(!dir.is_file(Path::new("foo/bar/blah")));
+        }
+
+        #[test]
+        fn test_list_dir() {
+            let dir = FakeDirectory::new();
+
+            assert_ok!(dir.create_subdir(Path::new("foo")));
+            assert_ok!(dir.create_subdir(Path::new("foo/bar")));
+            assert_ok!(dir.create_subdir(Path::new("foo/bar/baz")));
+            assert_ok!(dir.create_subdir(Path::new("ghlarbl")));
+            assert_ok!(dir.write_file(
+                Path::new("foo/bar/file1.txt"),
+                &EncryptedData::literal(&[1, 2, 3])
+            ));
+            assert_ok!(dir.write_file(
+                Path::new("foo/bar/file2.txt"),
+                &EncryptedData::literal(&[4, 5, 6])
+            ));
+            assert_ok!(dir.write_file(
+                Path::new("foo/file3.txt"),
+                &EncryptedData::literal(&[7, 8, 9])
+            ));
+            assert_ok!(dir.write_file(
+                Path::new("foo/bar/baz/file3.txt"),
+                &EncryptedData::literal(&[10, 11, 12])
+            ));
+            assert_ok!(dir.write_file(
+                Path::new("file4.txt"),
+                &EncryptedData::literal(&[13, 14, 15])
+            ));
+            assert_ok!(dir.write_file(
+                Path::new("ghlarbl/file5.txt"),
+                &EncryptedData::literal(&[16, 17, 18])
+            ));
+
+            let mut entries = assert_ok!(dir.list_subdir(Path::new("foo/bar")));
+            entries.sort();
+
+            assert_eq!(
+                entries,
+                &[
+                    Path::new("foo/bar/file1.txt"),
+                    Path::new("foo/bar/file2.txt"),
+                ]
+            );
+        }
     }
 }
