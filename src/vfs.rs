@@ -1,0 +1,269 @@
+use crate::directory::Directory;
+use crate::encryption::EncryptedData;
+use std::io::{ErrorKind, Result};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct DiskPath(pub PathBuf);
+
+#[derive(Debug)]
+struct FileBuffer<'a, D: Directory> {
+    disk_path: DiskPath,
+    buffer: Box<[u8]>,
+    directory: &'a D,
+    dirty: bool,
+}
+
+impl<'a, D: Directory> FileBuffer<'a, D> {
+    pub fn new(directory: &'a D, disk_path: &Path, buffer_len: usize) -> Result<Self> {
+        if directory.exists(disk_path) {
+            return Err(ErrorKind::AlreadyExists.into());
+        }
+
+        let mut ret = Self {
+            disk_path: DiskPath(disk_path.into()),
+            buffer: vec![0; buffer_len].into(),
+            directory,
+            dirty: true,
+        };
+        ret.flush()?;
+        Ok(ret)
+    }
+
+    pub fn open(directory: &'a D, disk_path: &Path) -> Result<Self> {
+        directory.read_file(disk_path).map(|data| Self {
+            disk_path: DiskPath(disk_path.into()),
+            buffer: data.data().into(),
+            directory,
+            dirty: false,
+        })
+    }
+
+    fn data(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+
+        match self
+            .directory
+            .write_file(&self.disk_path.0, &EncryptedData::literal(&self.buffer))
+        {
+            Ok(()) => {
+                self.dirty = false;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn write(&mut self, position: usize, data: &EncryptedData) -> Result<()> {
+        if position + data.data().len() > self.buffer.len() {
+            return Err(ErrorKind::InvalidInput.into());
+        }
+        (&mut self.buffer[position..position + data.data().len()]).copy_from_slice(data.data());
+        self.dirty = true;
+        Ok(())
+    }
+}
+
+impl<D: Directory> Drop for FileBuffer<'_, D> {
+    fn drop(&mut self) {
+        self.flush().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::directory::testing::FakeDirectory;
+    use crate::testing::assert_error_kind;
+    use assertables::assert_ok;
+
+    #[test]
+    fn test_drop() {
+        let directory = FakeDirectory::new();
+        {
+            let mut buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+            assert_ok!(buffer.write(0, &EncryptedData::literal(b"foo")));
+
+            let pre_drop_content = assert_ok!(directory.read_file(&Path::new("foo")));
+            assert_eq!(pre_drop_content.data(), &[0; 16]);
+        }
+
+        let post_drop_content = assert_ok!(directory.read_file(&Path::new("foo")));
+        assert_eq!(
+            post_drop_content.data(),
+            [b"foo".as_slice(), &[0; 13]].concat()
+        );
+    }
+
+    #[test]
+    fn test_flush() {
+        let directory = FakeDirectory::new();
+        let mut buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+        assert_ok!(buffer.write(0, &EncryptedData::literal(b"foo")));
+
+        let pre_flush_content = assert_ok!(directory.read_file(&Path::new("foo")));
+        assert_eq!(pre_flush_content.data(), &[0; 16]);
+
+        assert_ok!(buffer.flush());
+        let post_flush_content = assert_ok!(directory.read_file(&Path::new("foo")));
+        assert_eq!(
+            post_flush_content.data(),
+            [b"foo".as_slice(), &[0; 13]].concat()
+        );
+    }
+
+    #[test]
+    fn test_flush_idempotent() {
+        let directory = FakeDirectory::new();
+        let mut buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+        assert_ok!(buffer.write(0, &EncryptedData::literal(b"foo")));
+
+        assert_ok!(buffer.flush());
+        assert_ok!(directory.write_file(Path::new("foo"), &EncryptedData::literal(b"bar")));
+        // This one should not overwrite the file because the buffer hasn't changed.
+        assert_ok!(buffer.flush());
+
+        let post_flush_content = assert_ok!(directory.read_file(&Path::new("foo")));
+        assert_eq!(post_flush_content.data(), b"bar".as_slice());
+    }
+
+    #[test]
+    fn test_len() {
+        let directory = FakeDirectory::new();
+        let buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+        assert_eq!(buffer.len(), 16);
+    }
+
+    #[test]
+    fn test_new_fails_with_existing_file() {
+        let directory = FakeDirectory::new();
+        assert_ok!(directory.write_file(Path::new("foo"), &EncryptedData::literal(b"bar")));
+
+        assert_error_kind(
+            FileBuffer::new(&directory, &Path::new("foo"), 16),
+            ErrorKind::AlreadyExists,
+        );
+    }
+
+    #[test]
+    fn test_open_fails_for_nonexistent_file() {
+        let directory = FakeDirectory::new();
+        assert_error_kind(FileBuffer::open(&directory, &Path::new("foo")), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_open_populates_with_existing_file() {
+        let directory = FakeDirectory::new();
+        assert_ok!(directory.write_file(Path::new("foo"), &EncryptedData::literal(b"bar")));
+
+        let buffer = assert_ok!(FileBuffer::open(&directory, &Path::new("foo")));
+        assert_eq!(buffer.data(), b"bar");
+    }
+
+    #[test]
+    fn test_write_data_initializes_to_zero() {
+        let directory = FakeDirectory::new();
+        let buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+        assert_eq!(buffer.data(), &[0; 16]);
+    }
+
+    #[test]
+    fn test_write_data_at_beginning() {
+        let directory = FakeDirectory::new();
+        let mut buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+        assert_ok!(buffer.write(0, &EncryptedData::literal(b"foo")));
+
+        let expected = [b"foo".as_slice(), &[0u8; 13]].concat();
+        assert_eq!(buffer.data(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_write_data_at_end() {
+        let directory = FakeDirectory::new();
+        let mut buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+        assert_ok!(buffer.write(13, &EncryptedData::literal(b"foo")));
+
+        let expected = [&[0u8; 13], b"foo".as_slice()].concat();
+        assert_eq!(buffer.data(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_write_data_in_middle() {
+        let directory = FakeDirectory::new();
+        let mut buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+        assert_ok!(buffer.write(5, &EncryptedData::literal(b"foo")));
+
+        let expected = [&[0u8; 5], b"foo".as_slice(), &[0u8; 8]].concat();
+        assert_eq!(buffer.data(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_write_data_overwrites() {
+        let directory = FakeDirectory::new();
+        let mut buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+        assert_ok!(buffer.write(5, &EncryptedData::literal(b"foo")));
+        assert_ok!(buffer.write(7, &EncryptedData::literal(b"barbaz")));
+
+        let expected = [&[0u8; 5], b"fobarbaz".as_slice(), &[0; 3]].concat();
+        assert_eq!(buffer.data(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_write_fails_for_index_out_of_bounds() {
+        let directory = FakeDirectory::new();
+        let mut buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+        assert_error_kind(
+            buffer.write(16, &EncryptedData::literal(&[0])),
+            ErrorKind::InvalidInput,
+        );
+    }
+
+    #[test]
+    fn test_write_fails_for_overrun_at_end() {
+        let directory = FakeDirectory::new();
+        let mut buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+        assert_error_kind(
+            buffer.write(14, &EncryptedData::literal(b"foo")),
+            ErrorKind::InvalidInput,
+        );
+    }
+
+    #[test]
+    fn test_write_fails_for_too_big_input() {
+        let directory = FakeDirectory::new();
+        let mut buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+        assert_error_kind(
+            buffer.write(0, &EncryptedData::literal(&[0; 17])),
+            ErrorKind::InvalidInput,
+        );
+    }
+
+    #[test]
+    fn test_write_flushes_to_disk_for_file_not_present() {
+        let directory = FakeDirectory::new();
+        let _buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+        let disk_content = assert_ok!(directory.read_file(&Path::new("foo")));
+        assert_eq!(disk_content.data(), &[0; 16]);
+    }
+}

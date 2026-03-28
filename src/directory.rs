@@ -5,6 +5,11 @@ use std::path::{Path, PathBuf};
 pub trait Directory {
     fn create_subdir(&self, path: &Path) -> Result<()>;
     fn delete_file(&self, path: &Path) -> Result<()>;
+    fn exists(&self, path: &Path) -> bool {
+        self.is_directory(path) || self.is_file(path)
+    }
+    fn is_directory(&self, path: &Path) -> bool;
+    fn is_file(&self, path: &Path) -> bool;
     fn read_file(&self, path: &Path) -> Result<EncryptedData>;
     fn write_file(&self, path: &Path, data: &EncryptedData) -> Result<()>;
 }
@@ -30,6 +35,14 @@ impl Directory for FilesystemDirectory {
         std::fs::remove_file(self.base_dir.join(path))
     }
 
+    fn is_directory(&self, path: &Path) -> bool {
+        self.base_dir.join(path).is_dir()
+    }
+
+    fn is_file(&self, path: &Path) -> bool {
+        self.base_dir.join(path).is_file()
+    }
+
     fn read_file(&self, path: &Path) -> Result<EncryptedData> {
         std::fs::read(self.base_dir.join(path)).map(|bytes| EncryptedData::literal(&bytes))
     }
@@ -47,21 +60,17 @@ pub mod testing {
     use std::path::PathBuf;
     use std::sync::Mutex;
 
+    #[derive(Debug)]
     struct FakeDirectoryState {
         subdirs: HashSet<PathBuf>,
         files: HashMap<PathBuf, EncryptedData>,
+        injected_errors: HashMap<PathBuf, ErrorKind>,
+        total_outage: Option<ErrorKind>,
     }
 
     impl FakeDirectoryState {
         fn empty_directory() -> &'static Path {
             Path::new("")
-        }
-
-        fn parent_exists(&self, path: &Path) -> bool {
-            match path.parent() {
-                Some(parent) => self.subdirs.contains(parent) || parent == Self::empty_directory(),
-                None => false,
-            }
         }
 
         fn exists(&self, path: &Path) -> bool {
@@ -78,8 +87,27 @@ pub mod testing {
         fn is_file(&self, path: &Path) -> bool {
             self.files.contains_key(path)
         }
+
+        fn parent_exists(&self, path: &Path) -> bool {
+            match path.parent() {
+                Some(parent) => self.subdirs.contains(parent) || parent == Self::empty_directory(),
+                None => false,
+            }
+        }
+
+        fn return_injected_error_if_present(&self, path: &Path) -> Result<()> {
+            if let Some(total_error) = self.total_outage {
+                Err(total_error.clone().into())
+            }
+            else if let Some(injected_error) = self.injected_errors.get(path) {
+                Err(injected_error.clone().into())
+            } else {
+                Ok(())
+            }
+        }
     }
 
+    #[derive(Debug)]
     pub struct FakeDirectory {
         state: Mutex<FakeDirectoryState>,
     }
@@ -90,27 +118,25 @@ pub mod testing {
                 state: Mutex::new(FakeDirectoryState {
                     subdirs: HashSet::new(),
                     files: HashMap::new(),
+                    injected_errors: HashMap::new(),
+                    total_outage: None,
                 }),
             }
         }
 
-        pub fn exists(&self, path: &Path) -> bool {
-            let state = self.state.lock().unwrap();
-            state.exists(path)
+        pub fn inject_error(&self, path: &Path, error_kind: ErrorKind) {
+            let mut state = self.state.lock().unwrap();
+            state.injected_errors.insert(path.into(), error_kind);
         }
 
-        pub fn is_directory(&self, path: &Path) -> bool {
-            let state = self.state.lock().unwrap();
-            state.is_directory(path)
-        }
-
-        pub fn is_file(&self, path: &Path) -> bool {
-            let state = self.state.lock().unwrap();
-            state.is_file(path)
+        pub fn inject_total_outage(&self, error_kind: ErrorKind) {
+            let mut state = self.state.lock().unwrap();
+            state.total_outage = Some(error_kind);
         }
 
         pub fn list_subdir(&self, path: &Path) -> Result<Vec<PathBuf>> {
             let state = self.state.lock().unwrap();
+            state.return_injected_error_if_present(path)?;
 
             if state.is_file(path) {
                 return Err(ErrorKind::NotADirectory.into());
@@ -128,11 +154,22 @@ pub mod testing {
             }
             Ok(results)
         }
+
+        pub fn uninject_error(&self, path: &Path) {
+            let mut state = self.state.lock().unwrap();
+            state.injected_errors.remove(path);
+        }
+
+        pub fn uninject_total_outage(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.total_outage = None;
+        }
     }
 
     impl Directory for FakeDirectory {
         fn create_subdir(&self, path: &Path) -> Result<()> {
             let mut state = self.state.lock().unwrap();
+            state.return_injected_error_if_present(path)?;
 
             if state.exists(path) {
                 return Err(ErrorKind::AlreadyExists.into());
@@ -147,6 +184,7 @@ pub mod testing {
 
         fn delete_file(&self, path: &Path) -> Result<()> {
             let mut state = self.state.lock().unwrap();
+            state.return_injected_error_if_present(path)?;
 
             if !state.exists(path) {
                 return Err(ErrorKind::NotFound.into());
@@ -162,8 +200,33 @@ pub mod testing {
             }
         }
 
+        fn exists(&self, path: &Path) -> bool {
+            let state = self.state.lock().unwrap();
+            if state.injected_errors.contains_key(path) {
+                return false;
+            }
+            state.exists(path)
+        }
+
+        fn is_directory(&self, path: &Path) -> bool {
+            let state = self.state.lock().unwrap();
+            if state.injected_errors.contains_key(path) {
+                return false;
+            }
+            state.is_directory(path)
+        }
+
+        fn is_file(&self, path: &Path) -> bool {
+            let state = self.state.lock().unwrap();
+            if state.injected_errors.contains_key(path) {
+                return false;
+            }
+            state.is_file(path)
+        }
+
         fn read_file(&self, path: &Path) -> Result<EncryptedData> {
             let state = self.state.lock().unwrap();
+            state.return_injected_error_if_present(path)?;
 
             if state.is_directory(path) {
                 return Err(ErrorKind::IsADirectory.into());
@@ -177,6 +240,7 @@ pub mod testing {
 
         fn write_file(&self, path: &Path, data: &EncryptedData) -> Result<()> {
             let mut state = self.state.lock().unwrap();
+            state.return_injected_error_if_present(path)?;
 
             if state.is_directory(path) {
                 return Err(ErrorKind::IsADirectory.into());
@@ -196,9 +260,9 @@ pub mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
-    use assertables::{assert_err, assert_ok, assert_ok_eq_x};
+    use crate::testing::assert_error_kind;
+    use assertables::{assert_ok, assert_ok_eq_x};
     use rstest::rstest;
-    use std::fmt::Debug;
     use std::io::ErrorKind;
     use std::io::Result;
     use tempdir::TempDir;
@@ -221,6 +285,18 @@ mod tests {
             self.1.delete_file(path)
         }
 
+        fn exists(&self, path: &Path) -> bool {
+            self.1.exists(path)
+        }
+
+        fn is_directory(&self, path: &Path) -> bool {
+            self.1.is_directory(path)
+        }
+
+        fn is_file(&self, path: &Path) -> bool {
+            self.1.is_file(path)
+        }
+
         fn read_file(&self, path: &Path) -> Result<EncryptedData> {
             self.1.read_file(path)
         }
@@ -228,11 +304,6 @@ mod tests {
         fn write_file(&self, path: &Path, data: &EncryptedData) -> Result<()> {
             self.1.write_file(path, data)
         }
-    }
-
-    fn assert_error_kind<T: Debug>(result: Result<T>, kind: ErrorKind) {
-        let err = assert_err!(&result);
-        assert_eq!(err.kind(), kind);
     }
 
     #[rstest]
@@ -308,6 +379,90 @@ mod tests {
         ));
         assert_ok!(dir.delete_file(Path::new("foo/bar/baz")));
         assert_error_kind(dir.read_file(Path::new("foo/bar/baz")), ErrorKind::NotFound);
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_exists(#[case] dir: impl Directory) {
+        assert_ok!(dir.create_subdir(Path::new("foo")));
+        assert_ok!(dir.create_subdir(Path::new("foo/bar")));
+        assert_ok!(dir.create_subdir(Path::new("baz")));
+
+        assert_ok!(dir.write_file(Path::new("foo/file1"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok!(dir.write_file(Path::new("file2"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok!(dir.write_file(
+            Path::new("foo/bar/file3"),
+            &EncryptedData::literal(&[1, 2, 3])
+        ));
+
+        assert!(dir.exists(Path::new("")));
+        assert!(dir.exists(Path::new("foo")));
+        assert!(dir.exists(Path::new("foo/file1")));
+        assert!(dir.exists(Path::new("foo/bar")));
+        assert!(dir.exists(Path::new("foo/bar/file3")));
+        assert!(dir.exists(Path::new("file2")));
+        assert!(dir.exists(Path::new("baz")));
+
+        assert!(!dir.exists(Path::new("blah")));
+        assert!(!dir.exists(Path::new("foo/blah")));
+        assert!(!dir.exists(Path::new("foo/bar/blah")));
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_is_directory(#[case] dir: impl Directory) {
+        assert_ok!(dir.create_subdir(Path::new("foo")));
+        assert_ok!(dir.create_subdir(Path::new("foo/bar")));
+        assert_ok!(dir.create_subdir(Path::new("baz")));
+
+        assert_ok!(dir.write_file(Path::new("foo/file1"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok!(dir.write_file(Path::new("file2"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok!(dir.write_file(
+            Path::new("foo/bar/file3"),
+            &EncryptedData::literal(&[1, 2, 3])
+        ));
+
+        assert!(dir.is_directory(Path::new("")));
+        assert!(dir.is_directory(Path::new("foo")));
+        assert!(dir.is_directory(Path::new("foo/bar")));
+        assert!(dir.is_directory(Path::new("baz")));
+
+        assert!(!dir.is_directory(Path::new("foo/file1")));
+        assert!(!dir.is_directory(Path::new("foo/bar/file3")));
+        assert!(!dir.is_directory(Path::new("file2")));
+        assert!(!dir.is_directory(Path::new("blah")));
+        assert!(!dir.is_directory(Path::new("foo/blah")));
+        assert!(!dir.is_directory(Path::new("foo/bar/blah")));
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
+    fn test_is_file(#[case] dir: impl Directory) {
+        assert_ok!(dir.create_subdir(Path::new("foo")));
+        assert_ok!(dir.create_subdir(Path::new("foo/bar")));
+        assert_ok!(dir.create_subdir(Path::new("baz")));
+
+        assert_ok!(dir.write_file(Path::new("foo/file1"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok!(dir.write_file(Path::new("file2"), &EncryptedData::literal(&[1, 2, 3])));
+        assert_ok!(dir.write_file(
+            Path::new("foo/bar/file3"),
+            &EncryptedData::literal(&[1, 2, 3])
+        ));
+
+        assert!(dir.is_file(Path::new("foo/file1")));
+        assert!(dir.is_file(Path::new("foo/bar/file3")));
+        assert!(dir.is_file(Path::new("file2")));
+
+        assert!(!dir.is_file(Path::new("")));
+        assert!(!dir.is_file(Path::new("foo")));
+        assert!(!dir.is_file(Path::new("foo/bar")));
+        assert!(!dir.is_file(Path::new("baz")));
+        assert!(!dir.is_file(Path::new("blah")));
+        assert!(!dir.is_file(Path::new("foo/blah")));
+        assert!(!dir.is_file(Path::new("foo/bar/blah")));
     }
 
     #[rstest]
@@ -428,110 +583,112 @@ mod tests {
     }
 
     mod fake_directory_tests {
-        use super::super::testing::*;
         use super::super::*;
         use super::*;
 
         #[test]
-        fn test_exists() {
+        fn test_create_subdir_with_injected_error() {
             let dir = FakeDirectory::new();
 
-            assert_ok!(dir.create_subdir(Path::new("foo")));
-            assert_ok!(dir.create_subdir(Path::new("foo/bar")));
-            assert_ok!(dir.create_subdir(Path::new("baz")));
-
-            assert_ok!(dir.write_file(
-                Path::new("foo/file1"),
-                &EncryptedData::literal(&[1, 2, 3])
-            ));
-            assert_ok!(dir.write_file(
-                Path::new("file2"),
-                &EncryptedData::literal(&[1, 2, 3])
-            ));
-            assert_ok!(dir.write_file(
-                Path::new("foo/bar/file3"),
-                &EncryptedData::literal(&[1, 2, 3])
-            ));
-
-            assert!(dir.exists(Path::new("")));
-            assert!(dir.exists(Path::new("foo")));
-            assert!(dir.exists(Path::new("foo/file1")));
-            assert!(dir.exists(Path::new("foo/bar")));
-            assert!(dir.exists(Path::new("foo/bar/file3")));
-            assert!(dir.exists(Path::new("file2")));
-            assert!(dir.exists(Path::new("baz")));
-
-            assert!(!dir.exists(Path::new("blah")));
-            assert!(!dir.exists(Path::new("foo/blah")));
-            assert!(!dir.exists(Path::new("foo/bar/blah")));
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
+            assert_error_kind(
+                dir.create_subdir(Path::new("foo")),
+                ErrorKind::HostUnreachable,
+            );
         }
 
         #[test]
-        fn test_is_directory() {
+        fn test_delete_file_with_injected_error() {
             let dir = FakeDirectory::new();
 
-            assert_ok!(dir.create_subdir(Path::new("foo")));
-            assert_ok!(dir.create_subdir(Path::new("foo/bar")));
-            assert_ok!(dir.create_subdir(Path::new("baz")));
-
-            assert_ok!(dir.write_file(
-                Path::new("foo/file1"),
-                &EncryptedData::literal(&[1, 2, 3])
-            ));
-            assert_ok!(dir.write_file(
-                Path::new("file2"),
-                &EncryptedData::literal(&[1, 2, 3])
-            ));
-            assert_ok!(dir.write_file(
-                Path::new("foo/bar/file3"),
-                &EncryptedData::literal(&[1, 2, 3])
-            ));
-
-            assert!(dir.is_directory(Path::new("")));
-            assert!(dir.is_directory(Path::new("foo")));
-            assert!(dir.is_directory(Path::new("foo/bar")));
-            assert!(dir.is_directory(Path::new("baz")));
-
-            assert!(!dir.is_directory(Path::new("foo/file1")));
-            assert!(!dir.is_directory(Path::new("foo/bar/file3")));
-            assert!(!dir.is_directory(Path::new("file2")));
-            assert!(!dir.is_directory(Path::new("blah")));
-            assert!(!dir.is_directory(Path::new("foo/blah")));
-            assert!(!dir.is_directory(Path::new("foo/bar/blah")));
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
+            assert_error_kind(
+                dir.delete_file(Path::new("foo")),
+                ErrorKind::HostUnreachable,
+            );
         }
 
         #[test]
-        fn test_is_file() {
+        fn test_exists_with_injected_error() {
+            let dir = FakeDirectory::new();
+            assert_ok!(dir.create_subdir(Path::new("foo")));
+            assert_ok!(dir.write_file(Path::new("bar"), &EncryptedData::literal(&[1, 2, 3])));
+
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
+            dir.inject_error(Path::new("bar"), ErrorKind::AddrInUse);
+
+            assert!(!dir.exists(Path::new("foo")));
+            assert!(!dir.exists(Path::new("bar")));
+        }
+
+        #[test]
+        fn test_inject_error_avoids_other_paths() {
             let dir = FakeDirectory::new();
 
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
+            assert_ok!(dir.create_subdir(Path::new("bar")));
+        }
+
+        #[test]
+        fn test_inject_multiple_errors() {
+            let dir = FakeDirectory::new();
+
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
+            dir.inject_error(Path::new("bar"), ErrorKind::AddrInUse);
+            assert_error_kind(
+                dir.create_subdir(Path::new("foo")),
+                ErrorKind::HostUnreachable,
+            );
+            assert_error_kind(dir.create_subdir(Path::new("bar")), ErrorKind::AddrInUse);
+        }
+
+        #[test]
+        fn test_inject_total_outage_blocks_everything() {
+            let dir = FakeDirectory::new();
+
+            dir.inject_total_outage(ErrorKind::HostUnreachable);
+            assert_error_kind(
+                dir.create_subdir(Path::new("foo")),
+                ErrorKind::HostUnreachable,
+            );
+            assert_error_kind(
+                dir.write_file(Path::new("bar"), &EncryptedData::literal(&[1, 2, 3])),
+                ErrorKind::HostUnreachable,
+            );
+            assert_error_kind(
+                dir.read_file(Path::new("baz/qqq")),
+                ErrorKind::HostUnreachable,
+            );
+        }
+
+        #[test]
+        fn test_inject_total_outage_takes_precedence() {
+            let dir = FakeDirectory::new();
+
+            dir.inject_error(Path::new("foo"), ErrorKind::AddrInUse);
+            dir.inject_total_outage(ErrorKind::HostUnreachable);
+            assert_error_kind(
+                dir.create_subdir(Path::new("foo")),
+                ErrorKind::HostUnreachable,
+            );
+        }
+
+        #[test]
+        fn test_is_directory_with_injected_error() {
+            let dir = FakeDirectory::new();
             assert_ok!(dir.create_subdir(Path::new("foo")));
-            assert_ok!(dir.create_subdir(Path::new("foo/bar")));
-            assert_ok!(dir.create_subdir(Path::new("baz")));
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
 
-            assert_ok!(dir.write_file(
-                Path::new("foo/file1"),
-                &EncryptedData::literal(&[1, 2, 3])
-            ));
-            assert_ok!(dir.write_file(
-                Path::new("file2"),
-                &EncryptedData::literal(&[1, 2, 3])
-            ));
-            assert_ok!(dir.write_file(
-                Path::new("foo/bar/file3"),
-                &EncryptedData::literal(&[1, 2, 3])
-            ));
+            assert!(!dir.is_directory(Path::new("foo")));
+        }
 
-            assert!(dir.is_file(Path::new("foo/file1")));
-            assert!(dir.is_file(Path::new("foo/bar/file3")));
-            assert!(dir.is_file(Path::new("file2")));
+        #[test]
+        fn test_is_file_with_injected_error() {
+            let dir = FakeDirectory::new();
+            assert_ok!(dir.write_file(Path::new("foo"), &EncryptedData::literal(&[1, 2, 3])));
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
 
-            assert!(!dir.is_file(Path::new("")));
             assert!(!dir.is_file(Path::new("foo")));
-            assert!(!dir.is_file(Path::new("foo/bar")));
-            assert!(!dir.is_file(Path::new("baz")));
-            assert!(!dir.is_file(Path::new("blah")));
-            assert!(!dir.is_file(Path::new("foo/blah")));
-            assert!(!dir.is_file(Path::new("foo/bar/blah")));
         }
 
         #[test]
@@ -576,6 +733,90 @@ mod tests {
                     Path::new("foo/bar/file1.txt"),
                     Path::new("foo/bar/file2.txt"),
                 ]
+            );
+        }
+
+        #[test]
+        fn test_list_dir_with_injected_error() {
+            let dir = FakeDirectory::new();
+
+            assert_ok!(dir.create_subdir(Path::new("foo")));
+            assert_ok!(dir.write_file(
+                Path::new("foo/file.txt"),
+                &EncryptedData::literal(&[7, 8, 9])
+            ));
+
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
+
+            assert_error_kind(
+                dir.list_subdir(Path::new("foo")),
+                ErrorKind::HostUnreachable,
+            );
+        }
+
+        #[test]
+        fn test_read_file_with_injected_error() {
+            let dir = FakeDirectory::new();
+            assert_ok!(dir.write_file(Path::new("foo"), &EncryptedData::literal(&[1, 2, 3])));
+
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
+            assert_error_kind(dir.read_file(Path::new("foo")), ErrorKind::HostUnreachable);
+        }
+
+        #[test]
+        fn test_uninject_error() {
+            let dir = FakeDirectory::new();
+
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
+            assert_error_kind(
+                dir.create_subdir(Path::new("foo")),
+                ErrorKind::HostUnreachable,
+            );
+            dir.uninject_error(Path::new("foo"));
+            assert_ok!(dir.create_subdir(Path::new("foo")));
+        }
+
+        #[test]
+        fn test_uninject_multiple_errors() {
+            let dir = FakeDirectory::new();
+
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
+            dir.inject_error(Path::new("bar"), ErrorKind::AddrInUse);
+
+            dir.uninject_error(Path::new("foo"));
+            assert_ok!(dir.create_subdir(Path::new("foo")));
+            assert_error_kind(dir.create_subdir(Path::new("bar")), ErrorKind::AddrInUse);
+
+            dir.uninject_error(Path::new("bar"));
+            assert_ok!(dir.create_subdir(Path::new("bar")));
+        }
+
+        #[test]
+        fn test_uninject_total_outage() {
+            let dir = FakeDirectory::new();
+
+            dir.inject_total_outage(ErrorKind::HostUnreachable);
+            assert_error_kind(
+                dir.create_subdir(Path::new("foo")),
+                ErrorKind::HostUnreachable,
+            );
+            assert_error_kind(
+                dir.write_file(Path::new("bar"), &EncryptedData::literal(&[1, 2, 3])),
+                ErrorKind::HostUnreachable,
+            );
+
+            dir.uninject_total_outage();
+            assert_ok!(dir.create_subdir(Path::new("foo")));
+            assert_ok!(dir.write_file(Path::new("bar"), &EncryptedData::literal(&[1, 2, 3])),);
+        }
+
+        #[test]
+        fn test_write_file_with_injected_error() {
+            let dir = FakeDirectory::new();
+            dir.inject_error(Path::new("foo"), ErrorKind::HostUnreachable);
+            assert_error_kind(
+                dir.write_file(Path::new("foo"), &EncryptedData::literal(&[1, 2, 3])),
+                ErrorKind::HostUnreachable,
             );
         }
     }

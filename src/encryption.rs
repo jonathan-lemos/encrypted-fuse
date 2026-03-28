@@ -142,8 +142,8 @@ mod tests {
     fn test_fake_encryptor() {
         let mut encryptor = FakeDataEncryptorDecryptor::new();
 
-    let unencrypted1 = UnencryptedData::literal(&[1, 2, 3, 4, 5]);
-    let unencrypted2 = UnencryptedData::literal(&[69, 4, 20]);
+        let unencrypted1 = UnencryptedData::literal(&[1, 2, 3, 4, 5]);
+        let unencrypted2 = UnencryptedData::literal(&[69, 4, 20]);
         let unencrypted3 = UnencryptedData::literal(&[6, 9, 4, 2, 0]);
 
         let encrypted1 = EncryptedData::literal(&[5, 4, 3, 2, 1]);
