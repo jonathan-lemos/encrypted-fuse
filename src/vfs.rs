@@ -141,6 +141,26 @@ mod tests {
     }
 
     #[test]
+    fn test_flush_does_not_skip_future_write_on_failure() {
+        let directory = FakeDirectory::new();
+        let mut buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));
+
+        assert_ok!(buffer.write(0, &EncryptedData::literal(b"foo")));
+
+        directory.inject_total_outage(ErrorKind::NetworkUnreachable);
+        assert_error_kind(buffer.flush(), ErrorKind::NetworkUnreachable);
+        directory.uninject_total_outage();
+
+        assert_ok!(directory.write_file(Path::new("foo"), &EncryptedData::literal(b"bar")));
+        // This one should overwrite the file because the previous flush failed.
+        assert_ok!(buffer.flush());
+
+        let post_flush_content = assert_ok!(directory.read_file(&Path::new("foo")));
+        let expected = [b"foo".as_slice(), &[0; 13]].concat();
+        assert_eq!(post_flush_content.data(), &expected);
+    }
+
+    #[test]
     fn test_len() {
         let directory = FakeDirectory::new();
         let buffer = assert_ok!(FileBuffer::new(&directory, &Path::new("foo"), 16));

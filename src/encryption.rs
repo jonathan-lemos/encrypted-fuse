@@ -135,6 +135,7 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+    use assertables::{assert_none, assert_some};
     use super::*;
     use crate::encryption::testing::FakeDataEncryptorDecryptor;
 
@@ -165,12 +166,31 @@ mod tests {
     }
 
     #[test]
+    fn test_aes256_decrypt_fails_for_smaller_data_than_nonce() {
+        let encryptor = Aes256GcmEncryptorDecryptor::new([69; 32]);
+        let data = EncryptedData::literal(&[1, 2, 3, 4, 5]);
+
+        assert_none!(encryptor.decrypt(&data));
+    }
+
+    #[test]
+    fn test_aes256_decrypt_fails_for_different_key() {
+        let encryptor_69 = Aes256GcmEncryptorDecryptor::new([69; 32]);
+        let encryptor_42 = Aes256GcmEncryptorDecryptor::new([42; 32]);
+
+        let data = UnencryptedData::literal(&[1, 2, 3, 4, 5]);
+        let encrypted = assert_some!(encryptor_69.encrypt(&data));
+
+        assert_none!(encryptor_42.decrypt(&encrypted));
+    }
+
+    #[test]
     fn test_aes256_round_trip() {
         let encryptor = Aes256GcmEncryptorDecryptor::new([69; 32]);
         let data = UnencryptedData::literal(&[1, 2, 3, 4, 5]);
 
-        let encrypted = encryptor.encrypt(&data).unwrap();
-        let decrypted = encryptor.decrypt(&encrypted).unwrap();
+        let encrypted = assert_some!(encryptor.encrypt(&data));
+        let decrypted = assert_some!(encryptor.decrypt(&encrypted));
 
         assert_eq!(data, decrypted);
         assert_ne!(encrypted.data(), decrypted.data());
@@ -185,8 +205,8 @@ mod tests {
         }
         let data = UnencryptedData::literal(&bytes);
 
-        let encrypted = encryptor.encrypt(&data).unwrap();
-        let decrypted = encryptor.decrypt(&encrypted).unwrap();
+        let encrypted = assert_some!(encryptor.encrypt(&data));
+        let decrypted = assert_some!(encryptor.decrypt(&encrypted));
 
         assert_eq!(data, decrypted);
         assert_ne!(encrypted.data(), decrypted.data());
@@ -197,8 +217,8 @@ mod tests {
         let encryptor = Aes256GcmEncryptorDecryptor::new([69; 32]);
         let data = UnencryptedData::literal(&[]);
 
-        let encrypted = encryptor.encrypt(&data).unwrap();
-        let decrypted = encryptor.decrypt(&encrypted).unwrap();
+        let encrypted = assert_some!(encryptor.encrypt(&data));
+        let decrypted = assert_some!(encryptor.decrypt(&encrypted));
 
         assert_eq!(data, decrypted);
         assert_ne!(encrypted.data(), decrypted.data());

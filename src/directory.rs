@@ -89,17 +89,15 @@ pub mod testing {
         }
 
         fn parent_exists(&self, path: &Path) -> bool {
-            match path.parent() {
-                Some(parent) => self.subdirs.contains(parent) || parent == Self::empty_directory(),
-                None => false,
-            }
+            path.parent()
+                .map(|parent| self.is_directory(parent))
+                .unwrap_or(false)
         }
 
         fn return_injected_error_if_present(&self, path: &Path) -> Result<()> {
             if let Some(total_error) = self.total_outage {
                 Err(total_error.clone().into())
-            }
-            else if let Some(injected_error) = self.injected_errors.get(path) {
+            } else if let Some(injected_error) = self.injected_errors.get(path) {
                 Err(injected_error.clone().into())
             } else {
                 Ok(())
@@ -185,10 +183,6 @@ pub mod testing {
         fn delete_file(&self, path: &Path) -> Result<()> {
             let mut state = self.state.lock().unwrap();
             state.return_injected_error_if_present(path)?;
-
-            if !state.exists(path) {
-                return Err(ErrorKind::NotFound.into());
-            }
 
             if state.is_directory(path) {
                 return Err(ErrorKind::IsADirectory.into());
@@ -500,6 +494,16 @@ mod tests {
     #[rstest]
     #[case(FakeDirectory::new())]
     #[case(temp_fs_dir())]
+    fn test_write_file_fails_for_missing_parent(#[case] dir: impl Directory) {
+        assert_error_kind(
+            dir.write_file(Path::new("foo/bar"), &EncryptedData::literal(&[1, 2, 3])),
+            ErrorKind::NotFound,
+        );
+    }
+
+    #[rstest]
+    #[case(FakeDirectory::new())]
+    #[case(temp_fs_dir())]
     fn test_write_file_multiple_files(#[case] dir: impl Directory) {
         assert_ok!(dir.create_subdir(Path::new("dir1")));
         assert_ok!(dir.create_subdir(Path::new("dir1/dir2")));
@@ -734,6 +738,21 @@ mod tests {
                     Path::new("foo/bar/file2.txt"),
                 ]
             );
+        }
+
+        #[test]
+        fn test_list_dir_fails_on_file() {
+            let dir = FakeDirectory::new();
+
+            assert_ok!(dir.write_file(Path::new("foo"), &EncryptedData::literal(&[1, 2, 3])));
+            assert_error_kind(dir.list_subdir(Path::new("foo")), ErrorKind::NotADirectory);
+        }
+
+        #[test]
+        fn test_list_dir_fails_on_not_found() {
+            let dir = FakeDirectory::new();
+
+            assert_error_kind(dir.list_subdir(Path::new("foo")), ErrorKind::NotFound);
         }
 
         #[test]
