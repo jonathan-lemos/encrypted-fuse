@@ -7,6 +7,7 @@ pub struct UnencryptedData {
     data: Box<[u8]>,
 }
 
+// Represents a sequence of bytes that should not be written to disk because it's not encrypted.
 impl UnencryptedData {
     pub fn literal(data: &[u8]) -> Self {
         Self { data: data.into() }
@@ -17,6 +18,10 @@ impl UnencryptedData {
     }
 }
 
+// Represents a sequence of bytes that is safe to write to disk.
+//
+// This struct does not do any encryption. Its only purpose is to denote in the type system
+// which byte sequences are safe to write to disk.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct EncryptedData {
     data: Box<[u8]>,
