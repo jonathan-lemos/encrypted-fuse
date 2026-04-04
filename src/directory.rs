@@ -2,6 +2,7 @@ use crate::encryption::EncryptedData;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::io::Result;
+use std::ops::Add;
 use std::path::{Path, PathBuf};
 
 // Represents a path within the disk directory that we mount the FUSE in.
@@ -33,13 +34,21 @@ impl From<&Path> for DirectoryPath {
     }
 }
 
+impl Add<&DirectoryPath> for &DirectoryPath {
+    type Output = DirectoryPath;
+
+    fn add(self, rhs: &DirectoryPath) -> Self::Output {
+        DirectoryPath::from(self.0.join(&rhs.0).as_path())
+    }
+}
+
 impl Display for DirectoryPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.display())
     }
 }
 
-pub trait Directory {
+pub trait Directory: Send + Sync {
     fn create_subdir(&self, path: &DirectoryPath) -> Result<()>;
     fn delete_file(&self, path: &DirectoryPath) -> Result<()>;
     fn exists(&self, path: &DirectoryPath) -> bool {
@@ -94,7 +103,6 @@ pub mod testing {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::io::ErrorKind;
-    use std::path::PathBuf;
     use std::sync::Mutex;
 
     #[derive(Debug)]
