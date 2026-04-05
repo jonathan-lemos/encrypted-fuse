@@ -163,9 +163,9 @@ mod tests {
 
         assert_ok!(buffer.write(0, &EncryptedData::literal(b"foo")));
 
-        directory.inject_total_outage(ErrorKind::NetworkUnreachable);
+        directory.disconnect();
         assert_error_kind(buffer.flush(), ErrorKind::NetworkUnreachable);
-        directory.uninject_total_outage();
+        directory.reset_on_operation();
 
         assert_ok!(directory.write_file(&path, &EncryptedData::literal(b"bar")));
         // This one should overwrite the file because the previous flush failed.
