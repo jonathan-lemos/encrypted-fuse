@@ -202,7 +202,7 @@ pub mod testing {
         }
 
         pub fn assert_only_matching<P: FnMut(&FsOperation) -> bool>(&self, predicate: P) {
-            assert_eq!(self.len(), 1);
+            assert_eq!(self.len(), 1, "Expected a single element, but got {:?}", self.log);
             self.assert_single_matching(predicate);
         }
 

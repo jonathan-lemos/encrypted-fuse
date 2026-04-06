@@ -1,3 +1,4 @@
+mod datastructures;
 mod encryption;
 mod directory;
 mod vfs;

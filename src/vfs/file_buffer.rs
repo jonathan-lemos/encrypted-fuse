@@ -33,7 +33,7 @@ impl<'a, D: Directory> FileBuffer<'a, D> {
                 // Prevent flushing on Drop which will panic
                 ret.dirty = false;
                 Err(e)
-            },
+            }
         }
     }
 
@@ -100,6 +100,16 @@ mod tests {
     use assertables::assert_ok;
 
     #[test]
+    fn test_disk_path() {
+        let directory = FakeDirectory::new();
+        let path = DirectoryPath::from("foo");
+        assert_ok!(directory.write_file(&path, &EncryptedData::literal(b"bar")));
+
+        let buffer = assert_ok!(FileBuffer::open(&directory, path.clone()));
+        assert_eq!(buffer.disk_path(), &path);
+    }
+
+    #[test]
     fn test_drop() {
         let directory = FakeDirectory::new();
         let path = DirectoryPath::from("foo");
@@ -146,13 +156,18 @@ mod tests {
 
         assert_ok!(buffer.write(0, &EncryptedData::literal(b"foo")));
 
-        assert_ok!(buffer.flush());
-        assert_ok!(directory.write_file(&path, &EncryptedData::literal(b"bar")));
-        // This one should not overwrite the file because the buffer hasn't changed.
-        assert_ok!(buffer.flush());
+        directory
+            .log_during(|| {
+                assert_ok!(buffer.flush());
+                assert_ok!(buffer.flush());
+            })
+            .assert_only_matching(|op| op.is_write_file());
 
         let post_flush_content = assert_ok!(directory.read_file(&path));
-        assert_eq!(post_flush_content.data(), b"bar".as_slice());
+        assert_eq!(
+            post_flush_content.data(),
+            [b"foo".as_slice(), &[0; 13]].concat()
+        );
     }
 
     #[test]
@@ -166,10 +181,11 @@ mod tests {
         directory.disconnect();
         assert_error_kind(buffer.flush(), ErrorKind::NetworkUnreachable);
         directory.reset_on_operation();
-
-        assert_ok!(directory.write_file(&path, &EncryptedData::literal(b"bar")));
-        // This one should overwrite the file because the previous flush failed.
-        assert_ok!(buffer.flush());
+        directory
+            .log_during(|| {
+                assert_ok!(buffer.flush());
+            })
+            .assert_only_matching(|op| op.is_write_file());
 
         let post_flush_content = assert_ok!(directory.read_file(&path));
         let expected = [b"foo".as_slice(), &[0; 13]].concat();
@@ -188,12 +204,34 @@ mod tests {
     fn test_new_fails_with_existing_file() {
         let directory = FakeDirectory::new();
         let path = DirectoryPath::from("foo");
+
         assert_ok!(directory.write_file(&path, &EncryptedData::literal(b"bar")));
 
-        assert_error_kind(
-            FileBuffer::new(&directory, path.clone(), 16),
-            ErrorKind::AlreadyExists,
-        );
+        directory
+            .log_during(|| {
+                assert_error_kind(
+                    FileBuffer::new(&directory, path.clone(), 16),
+                    ErrorKind::AlreadyExists,
+                );
+            })
+            .assert_only_matching(|op| op.is_file_type());
+    }
+
+    #[test]
+    fn test_new_fails_for_io_error() {
+        let directory = FakeDirectory::new();
+        let path = DirectoryPath::from("foo");
+
+        directory.disconnect();
+
+        let log = directory.log_during(|| {
+            assert_error_kind(
+                FileBuffer::new(&directory, path.clone(), 16),
+                ErrorKind::NetworkUnreachable,
+            );
+        });
+        // Should not write a second time on Drop of the intermediate struct.
+        log.assert_single_matching(|op| op.is_write_file());
     }
 
     #[test]

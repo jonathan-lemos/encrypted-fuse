@@ -8,19 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::io::ErrorKind;
 
-#[derive(Debug)]
-pub enum VirtualFileOpenError {
-    IOError {
-        error: std::io::Error,
-        path: DirectoryPath,
-    },
-    ChunkSizeMismatch {
-        expected_size: usize,
-        path: DirectoryPath,
-        actual_size: usize,
-    },
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize)]
 pub struct VirtualFileDescriptor {
     chunk_paths: Vec<DirectoryPath>,
@@ -74,15 +61,15 @@ impl<'a, 'b, D: Directory, G: DirectoryPathGen> VirtualFile<'a, 'b, D, G> {
         directory: &'a D,
         path_generator: &'b G,
         descriptor: VirtualFileDescriptor,
-    ) -> Result<Self, VirtualFileOpenError> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             directory,
             path_generator,
             chunk_paths: descriptor.chunk_paths.into_iter().collect(),
             chunk_buffers: LruCache::new(usize!(16)),
             chunk_size: descriptor.chunk_size,
             total_size: descriptor.total_size,
-        })
+        }
     }
 
     pub fn descriptor(&self) -> VirtualFileDescriptor {
@@ -117,7 +104,8 @@ impl<'a, 'b, D: Directory, G: DirectoryPathGen> VirtualFile<'a, 'b, D, G> {
                 self.open_chunk(self.chunk_paths[chunk_number].clone())?
             };
 
-            let write_data = EncryptedData::literal(&data.data()[data_position..data_position + write_len]);
+            let write_data =
+                EncryptedData::literal(&data.data()[data_position..data_position + write_len]);
             chunk.write(chunk_pos, &write_data)?;
 
             chunk_number += 1;
@@ -161,11 +149,11 @@ impl<'a, 'b, D: Directory, G: DirectoryPathGen> VirtualFile<'a, 'b, D, G> {
 
 #[cfg(test)]
 mod tests {
-    use assertables::assert_ok;
-    use quickcheck_macros::quickcheck;
+    use super::*;
     use crate::directory::testing::FakeDirectory;
     use crate::vfs::directory_path_gen::SequentialDirectoryPathGen;
-    use super::*;
+    use assertables::assert_ok;
+    use quickcheck_macros::quickcheck;
 
     #[quickcheck]
     fn read_write_is_identity(data: Vec<u8>) {
