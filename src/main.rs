@@ -1,4 +1,4 @@
-mod datastructures;
+mod data_structures;
 mod encryption;
 mod directory;
 mod vfs;

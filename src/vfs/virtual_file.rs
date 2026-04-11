@@ -7,6 +7,7 @@ use nonzero_lit::usize;
 use serde::{Deserialize, Serialize};
 use std::cmp::min;
 use std::io::ErrorKind;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, PartialOrd, Ord, Serialize)]
 pub struct VirtualFileDescriptor {
@@ -16,22 +17,23 @@ pub struct VirtualFileDescriptor {
 }
 
 #[derive(Debug)]
-pub struct VirtualFile<'a, 'b, D: Directory, G: DirectoryPathGen> {
-    directory: &'a D,
-    path_generator: &'b G,
+pub struct VirtualFile<D: Directory, G: DirectoryPathGen> {
+    directory: Arc<D>,
+    path_generator: Arc<G>,
     chunk_paths: Vec<DirectoryPath>,
-    chunk_buffers: LruCache<DirectoryPath, FileBuffer<'a, D>>,
+    chunk_buffers: LruCache<DirectoryPath, FileBuffer<D>>,
     chunk_size: usize,
     total_size: usize,
 }
 
-impl<'a, 'b, D: Directory, G: DirectoryPathGen> VirtualFile<'a, 'b, D, G> {
-    fn open_chunk(&mut self, path: DirectoryPath) -> std::io::Result<&mut FileBuffer<'a, D>> {
-        self.chunk_buffers
-            .try_get_or_insert_mut_ref(&path, || FileBuffer::open(self.directory, path.clone()))
+impl<D: Directory, G: DirectoryPathGen> VirtualFile<D, G> {
+    fn open_chunk(&mut self, path: DirectoryPath) -> std::io::Result<&mut FileBuffer<D>> {
+        self.chunk_buffers.try_get_or_insert_mut_ref(&path, || {
+            FileBuffer::open(self.directory.clone(), path.clone())
+        })
     }
 
-    fn next_chunk(&mut self) -> std::io::Result<&mut FileBuffer<'a, D>> {
+    fn next_chunk(&mut self) -> std::io::Result<&mut FileBuffer<D>> {
         let num_data_chunks =
             self.total_size / self.chunk_size + min(self.total_size % self.chunk_size, 1);
         if num_data_chunks < self.chunk_paths.len() {
@@ -40,13 +42,13 @@ impl<'a, 'b, D: Directory, G: DirectoryPathGen> VirtualFile<'a, 'b, D, G> {
 
         let path = self.path_generator.generate_path();
         self.chunk_buffers.try_get_or_insert_mut_ref(&path, || {
-            let buffer = FileBuffer::new(self.directory, path.clone(), self.chunk_size)?;
+            let buffer = FileBuffer::new(self.directory.clone(), path.clone(), self.chunk_size)?;
             self.chunk_paths.push(path.clone());
             Ok(buffer)
         })
     }
 
-    pub fn new(directory: &'a D, path_generator: &'b G, chunk_size: usize) -> Self {
+    pub fn new(directory: Arc<D>, path_generator: Arc<G>, chunk_size: usize) -> Self {
         Self {
             directory,
             path_generator,
@@ -58,8 +60,8 @@ impl<'a, 'b, D: Directory, G: DirectoryPathGen> VirtualFile<'a, 'b, D, G> {
     }
 
     pub fn open<I: Iterator<Item = DirectoryPath>>(
-        directory: &'a D,
-        path_generator: &'b G,
+        directory: Arc<D>,
+        path_generator: Arc<G>,
         descriptor: VirtualFileDescriptor,
     ) -> Self {
         Self {
@@ -158,10 +160,10 @@ mod tests {
     #[quickcheck]
     fn read_write_is_identity(data: Vec<u8>) {
         let dir_path = DirectoryPath::from("chunks");
-        let dir = FakeDirectory::new();
+        let dir = Arc::new(FakeDirectory::new());
         assert_ok!(dir.create_subdir(&dir_path));
-        let pathgen = SequentialDirectoryPathGen::new(dir_path.clone(), 1);
-        let mut file = VirtualFile::new(&dir, &pathgen, 8);
+        let pathgen = Arc::new(SequentialDirectoryPathGen::new(dir_path.clone(), 1));
+        let mut file = VirtualFile::new(dir.clone(), pathgen, 8);
         let enc_data = EncryptedData::literal(&data);
 
         assert_ok!(file.write(0, &enc_data));

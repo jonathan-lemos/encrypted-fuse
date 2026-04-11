@@ -144,14 +144,14 @@ mod tests {
 
     #[test]
     fn test_head() {
-        let (linked_list, nodes) = create([1, 2, 3]);
+        let (linked_list, _) = create([1, 2, 3]);
         let head = assert_some!(linked_list.head());
         assert_eq!(head.value(), Rc::new(1));
     }
 
     #[test]
     fn test_iter() {
-        let (linked_list, nodes) = create([1, 2, 3]);
+        let (linked_list, _) = create([1, 2, 3]);
         let values = iter(linked_list);
         assert_eq!(values, vec![1, 2, 3]);
     }
@@ -159,6 +159,17 @@ mod tests {
     #[test]
     fn test_iter_empty() {
         let linked_list = LinkedList::<i32>::new();
+        let values = iter(linked_list);
+        assert_eq!(values, &[]);
+    }
+
+    #[test]
+    fn remove_all() {
+        let (mut linked_list, mut nodes) = create([1, 2, 3]);
+        linked_list.remove(assert_some!(nodes.pop()));
+        linked_list.remove(assert_some!(nodes.pop()));
+        linked_list.remove(assert_some!(nodes.pop()));
+
         let values = iter(linked_list);
         assert_eq!(values, &[]);
     }
@@ -188,6 +199,16 @@ mod tests {
 
         let values = iter(linked_list);
         assert_eq!(values, &[1, 3]);
+    }
+
+    #[test]
+    fn remove_multiple() {
+        let (mut linked_list, mut nodes) = create([1, 2, 3]);
+        linked_list.remove(nodes.remove(1));
+        linked_list.remove(nodes.remove(0));
+
+        let values = iter(linked_list);
+        assert_eq!(values, &[3]);
     }
 
     #[test]
