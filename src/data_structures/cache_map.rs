@@ -73,6 +73,16 @@ where
         Ok(())
     }
 
+    pub fn clear(&mut self) -> Result<(), E> {
+        let keys = self.entries.keys().map(|x| x.clone()).collect::<Vec<K>>();
+        for key in keys.into_iter() {
+            (self.drop_fn)(&key, self.entries.get_mut(&key).unwrap())?;
+            self.entries.remove(&key);
+            self.remove_from_linked_list(&key);
+        }
+        Ok(())
+    }
+
     pub fn try_get(&mut self, key: &K) -> Result<&V, E> {
         self.populate_if_necessary(key)?;
         Ok(self.entries.get(key).unwrap())
@@ -92,6 +102,54 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn test_clear_drops_all_elems() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+
+        let drop_count_clone = drop_count.clone();
+        let mut map = CacheMap::new(
+            4,
+            |k: &i32| Ok::<i32, ()>(k + 1),
+            move |_, _| {
+                drop_count_clone.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        );
+
+        assert_ok!(map.try_get_mut(&1));
+        assert_ok!(map.try_get_mut(&2));
+        assert_ok!(map.try_get_mut(&3));
+        assert_ok!(map.try_get_mut(&4));
+
+        assert_ok!(map.clear());
+
+        assert_eq!(drop_count.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn test_clear_short_circuits_if_drop_fn_fails() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+
+        let drop_count_clone = drop_count.clone();
+        let mut map = CacheMap::new(
+            4,
+            |k: &i32| Ok(k + 1),
+            move |_, _| {
+                drop_count_clone.fetch_add(1, Ordering::Relaxed);
+                Err(())
+            },
+        );
+
+        assert_ok!(map.try_get_mut(&1));
+        assert_ok!(map.try_get_mut(&2));
+        assert_ok!(map.try_get_mut(&3));
+        assert_ok!(map.try_get_mut(&4));
+
+        assert_err!(map.clear());
+
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
     #[quickcheck]
     fn test_correctly_computes_entries(nums: Vec<i32>) {
         let mut map = CacheMap::new(4, |k: &i32| Ok::<i32, ()>(k.wrapping_add(1)), |_, _| Ok(()));
@@ -102,13 +160,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_keeps_mutations_while_in_cache() {
-        let mut map = CacheMap::new(4, |k| Ok::<i32, ()>(k + 1), |_, _| Ok(()));
-
-        *map.try_get_mut(&42).unwrap() = 69;
-        assert_eq!(*map.try_get(&42).unwrap(), 69);
-    }
 
     #[test]
     fn test_drops_mutations_when_evicted() {
@@ -208,5 +259,13 @@ mod tests {
         assert_ok!(map.try_get_mut(&4));
         assert_ok!(map.try_get_mut(&5));
         assert_err!(map.try_get_mut(&6));
+    }
+
+    #[test]
+    fn test_keeps_mutations_while_in_cache() {
+        let mut map = CacheMap::new(4, |k| Ok::<i32, ()>(k + 1), |_, _| Ok(()));
+
+        *map.try_get_mut(&42).unwrap() = 69;
+        assert_eq!(*map.try_get(&42).unwrap(), 69);
     }
 }

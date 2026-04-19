@@ -350,9 +350,16 @@ pub mod testing {
             }
         }
 
-        pub fn on_operation(&self, f: Box<dyn Fn(FsOperation) -> Result<()> + Send + Sync>) {
+        pub fn on_operation<F: Fn(FsOperation) -> Result<()> + Send + Sync + 'static>(&self, f: F) {
             let mut state = self.state.lock().unwrap();
-            state.on_operation = f;
+            state.on_operation = Box::new(f);
+        }
+
+        pub fn read_only(&self) {
+            self.on_operation(|op| match op {
+                FsOperation::WriteFile(_, _) => Err(ErrorKind::PermissionDenied.into()),
+                _ => Ok(())
+            });
         }
 
         pub fn reset_on_operation(&self) {
